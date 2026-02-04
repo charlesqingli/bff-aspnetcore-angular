@@ -16,6 +16,8 @@ This document explains how the two XSRF-related cookies work, where they are set
 - [Request Flow: Logout Form with XSRF](#request-flow-logout-form-with-xsrf)
 - [Endpoints: Where XSRF Is Required or Skipped](#endpoints-where-xsrf-is-required-or-skipped)
 - [Why Two Cookies](#why-two-cookies)
+- [Comparison with Microsoft's XSRF guidance](#comparison-with-microsofts-xsrf-guidance)
+- [Comparison with Angular's XSRF approach](#comparison-with-angulars-xsrf-approach)
 - [Summary](#summary)
 
 ---
@@ -188,16 +190,6 @@ So for **all requests to /api/** (same origin), the client sends:
 - **Cookie:** `XSRF-RequestToken=<value>` (and automatically **__Host-X-XSRF-TOKEN**)
 - **Header:** `X-XSRF-TOKEN: <same value as XSRF-RequestToken>`
 
-### Why Not Angular's Default XSRF?
-
-Angular's [built-in XSRF protection](https://angular.dev/best-practices/security#httpclient-xsrf-csrf-security) reads a cookie named **`XSRF-TOKEN`** (configurable) and sends it in the **`X-XSRF-TOKEN`** header—but **only on mutating requests** (POST, PUT, PATCH, DELETE). It does **not** add the header to GET or HEAD requests.
-
-This solution **validates XSRF on GET** for protected APIs (e.g. `WeatherApiController` uses `[ValidateAntiForgeryToken]` at controller level, so even `GET /api/WeatherApi` must include a valid token). If the client used Angular's default implementation, those GET requests would not send `X-XSRF-TOKEN`, and the BFF would reject them with 400.
-
-So the app uses a **custom interceptor** (`secure-api.interceptor.ts`) that adds the `X-XSRF-TOKEN` header to **all** requests to `/api/` (including GET), and uses a separate cookie name (**`XSRF-RequestToken`**) to avoid relying on Angular's built-in behavior. The server sets that cookie name in `_Host.cshtml` and `UserController` to match.
-
-**Summary:** Angular's default is "token only on mutating requests"; this BFF requires the token on GET as well, so the default cannot be used as-is.
-
 ### For Logout (Form POST)
 
 **File:** `ui/src/app/home.component.html`
@@ -293,6 +285,18 @@ sequenceDiagram
     BFF->>Browser: 302 Redirect to /
 ```
 
+### Why XSRF is skipped on Logout
+
+Logout uses **IgnoreAntiforgeryToken** for three reasons:
+
+1. **Authentication is required.** The Logout action has **[Authorize]**, so the request must include the auth cookie. Only an already-authenticated user can trigger logout. A cross-site forger cannot perform actions *as* the user—they can at most cause the user to be signed out.
+
+2. **Antiforgery token lifecycle.** After login, the user's identity changes. The antiforgery token may be bound to the previous (anonymous) identity or invalidated when a new one is issued. Requiring XSRF on the first request after login (e.g. logout) could cause validation to fail (400) unless the app explicitly refreshes the token (e.g. via GET /api/User or the SPA shell). Skipping XSRF on Logout avoids that edge case.
+
+3. **Lower impact.** The worst case of a forged logout request is that the user is signed out. That is inconvenient but not equivalent to an attacker changing data or performing privileged operations on the user's behalf. Protecting logout with XSRF is optional in many guidance; relying on **[Authorize]** here is a common and accepted trade-off.
+
+The form still sends **__RequestVerificationToken** in the body so that if the attribute is removed later, the endpoint will already receive a valid token.
+
 ---
 
 ## Endpoints: Where XSRF Is Required or Skipped
@@ -347,6 +351,68 @@ On a **forged** request from another site:
 
 So the **XSRF cookie** (the pair: __Host- cookie + request token sent in header or form) is used to ensure that state-changing or sensitive API requests originate from your own front-end, not from a cross-site forger.
 
+**Alignment with guidelines:** This two-cookie design matches both **Microsoft** and **Angular** guidance. Microsoft’s antiforgery model uses a secret (stored in a cookie) plus a request token that the client sends in the **X-XSRF-TOKEN** header or in a form field; the server validates that the header/form value and the secret belong to the same token pair. Here, **__Host-X-XSRF-TOKEN** is the secret (HttpOnly) and **XSRF-RequestToken** is the value the client sends in the header—the same pattern. Angular’s approach is to have the backend set a cookie that the client can read and send in **X-XSRF-TOKEN**; this app does that with **XSRF-RequestToken**, while the secret stays in a separate HttpOnly cookie for stronger protection. So the split (secret cookie + client-readable cookie) is consistent with both: Microsoft’s token-pair validation and Angular’s “cookie → header” flow.
+
+---
+
+## Comparison with Microsoft's XSRF guidance
+
+**Official guidelines:**
+
+- [Prevent Cross-Site Request Forgery (XSRF/CSRF) attacks in ASP.NET Core](https://learn.microsoft.com/en-us/aspnet/core/security/anti-request-forgery) — main antiforgery documentation
+- [Configure ASP.NET Core Data Protection](https://learn.microsoft.com/en-us/aspnet/core/security/data-protection/configuration/overview) — required for antiforgery when using a server farm / multiple nodes
+
+This implementation aligns with the [antiforgery documentation](https://learn.microsoft.com/en-us/aspnet/core/security/anti-request-forgery) above. Detailed comparison:
+
+| Area | Microsoft / common practice | This implementation | Verdict |
+|------|-----------------------------|---------------------|--------|
+| **Header name** | `X-XSRF-TOKEN` for AJAX/API | `X-XSRF-TOKEN` | ✅ Matches |
+| **Token in header vs body** | Prefer header for API/AJAX (token not replayed via cookie) | Token sent in `X-XSRF-TOKEN` header for API calls | ✅ Matches |
+| **Secret cookie** | HttpOnly cookie; default name common | `__Host-X-XSRF-TOKEN`, HttpOnly, Secure, SameSite=Strict, `__Host-` prefix | ✅ Stricter (host-only, always secure) |
+| **Global validation** | `AutoValidateAntiforgeryTokenAttribute` for MVC/API | Same, added in `AddControllersWithViews` | ✅ Matches |
+| **Which methods validated** | `AutoValidateAntiforgeryToken` validates only "unsafe" methods (POST, PUT, PATCH, DELETE), not GET | Plus `[ValidateAntiForgeryToken]` on WeatherApiController so GET is validated too | ✅ Intentional (protect sensitive API GETs in BFF) |
+| **Skipping validation** | Use `[IgnoreAntiforgeryToken]` where validation is inappropriate (e.g. logout after login) | Logout uses `[IgnoreAntiforgeryToken]` + `[Authorize]`, with comment explaining why | ✅ Appropriate |
+| **Token after auth change** | Refresh token after login so it is bound to current identity | Tokens refreshed on SPA load and on GET /api/User | ✅ Good |
+| **Client-readable cookie** | Docs often reference a cookie readable by JS (e.g. Angular’s `XSRF-TOKEN`) for the value sent in the header | Uses `XSRF-RequestToken` and a custom interceptor so the token is sent on **all** `/api/` requests (including GET) | ✅ Equivalent (cookie name and “all requests” are a deliberate BFF choice) |
+| **Form field** | `__RequestVerificationToken` for form POSTs | Logout form uses `__RequestVerificationToken` | ✅ Matches |
+| **HTTPS / cookie security** | Antiforgery cookies should be Secure (HTTPS) in production | `SecurePolicy = Always`, SameSite Strict | ✅ Matches / stricter |
+| **Data Protection** | In a server farm, use a shared Data Protection key store so antiforgery tokens validate across nodes | Not in code snippet; ensure configured when scaling out | ⚠️ Configure when scaling out |
+
+**Conclusion:** The implementation follows Microsoft's XSRF guidance. Differences are either **stricter** (cookie naming and security) or **equivalent** (custom cookie name + interceptor instead of Angular's default `XSRF-TOKEN`). If running in a server farm, configure [Data Protection](https://learn.microsoft.com/en-us/aspnet/core/security/data-protection/configuration/overview) for a shared key store.
+
+---
+
+## Comparison with Angular's XSRF approach
+
+**Official guideline:**
+
+- [Security – HttpClient XSRF/CSRF](https://angular.dev/best-practices/security#httpclient-xsrf-csrf-security) — security best practices
+
+### Comparison table
+
+Angular's built-in XSRF protection uses a cookie-to-header mechanism. This BFF uses a **custom interceptor** instead of Angular's default so that the token is sent on **all** API requests (including GET). Comparison:
+
+| Area | Angular's recommended approach | This implementation | Verdict |
+|------|--------------------------------|---------------------|--------|
+| **Cookie name** | Default `XSRF-TOKEN` (configurable via `withXsrfConfiguration`) | `XSRF-RequestToken` | ⚠️ Different name; server and client agree explicitly |
+| **Header name** | Default `X-XSRF-TOKEN` | `X-XSRF-TOKEN` | ✅ Matches |
+| **When token is sent** | Only on **mutating** requests (POST, PUT, PATCH, DELETE); not on GET or HEAD | On **all** requests to `/api/` (including GET) | ⚠️ Deliberate: BFF validates XSRF on protected GETs (e.g. WeatherApi) |
+| **How it's implemented** | Built-in `HttpClient` XSRF interceptor (no extra code if defaults used) | Custom interceptor (`secure-api.interceptor.ts`) + `getCookie('XSRF-RequestToken')` | ⚠️ Custom code required because GET must carry the token |
+| **Backend contract** | Server sets cookie (e.g. on page load or first GET); server verifies header on requests | Same: _Host.cshtml and UserController set `XSRF-RequestToken`; BFF validates `X-XSRF-TOKEN` | ✅ Aligned |
+| **Relative vs absolute URLs** | Angular default only sends token to **relative** URLs | Interceptor sends token for requests whose URL starts with same-origin `/api/` | ✅ Same idea (same-origin API only) |
+
+**Conclusion:** Angular's default ("token only on mutating requests") is sufficient for many backends that do not validate XSRF on GET. This BFF **validates XSRF on GET** for protected APIs, so the default would cause 400s on those GETs. The implementation therefore uses a **custom interceptor** and a **custom cookie name** (`XSRF-RequestToken`) to send the token on every `/api/` request. Conceptually it follows Angular's pattern (cookie → header, same-origin); the differences are intentional for the BFF's stricter GET protection.
+
+### Why Not Angular's Default XSRF?
+
+Angular's built-in XSRF protection reads a cookie named **`XSRF-TOKEN`** (configurable) and sends it in the **`X-XSRF-TOKEN`** header—but **only on mutating requests** (POST, PUT, PATCH, DELETE). It does **not** add the header to GET or HEAD requests.
+
+This solution **validates XSRF on GET** for protected APIs (e.g. `WeatherApiController` uses `[ValidateAntiForgeryToken]` at controller level, so even `GET /api/WeatherApi` must include a valid token). If the client used Angular's default implementation, those GET requests would not send `X-XSRF-TOKEN`, and the BFF would reject them with 400.
+
+So the app uses a **custom interceptor** (`secure-api.interceptor.ts`) that adds the `X-XSRF-TOKEN` header to **all** requests to `/api/` (including GET), and uses a separate cookie name (**`XSRF-RequestToken`**) to avoid relying on Angular's built-in behavior. The server sets that cookie name in `_Host.cshtml` and `UserController` to match.
+
+**Summary:** Angular's default is "token only on mutating requests"; this BFF requires the token on GET as well, so the default cannot be used as-is.
+
 ---
 
 ## Summary
@@ -355,26 +421,6 @@ So the **XSRF cookie** (the pair: __Host- cookie + request token sent in header 
 - **Set when:** _Host.cshtml on every SPA load; UserController on every GET /api/User.
 - **Client:** Angular reads **XSRF-RequestToken** via **getCookie** and sends it in the **X-XSRF-TOKEN** header for all **/api/** requests (secure-api interceptor). Logout form sends it as **__RequestVerificationToken** in the body.
 - **Server:** Antiforgery validates **X-XSRF-TOKEN** (or form field) against **__Host-X-XSRF-TOKEN**. **ValidateAntiForgeryToken** on WeatherApiController enforces this for the weather API; **IgnoreAntiforgeryToken** on Logout skips it there.
-
----
-
-## Comparison with Microsoft's XSRF guidance
-
-This implementation aligns with [Microsoft's antiforgery documentation](https://learn.microsoft.com/en-us/aspnet/core/security/anti-request-forgery). Summary:
-
-| Area | Match / note |
-|------|----------------|
-| Header name `X-XSRF-TOKEN` | ✅ Matches |
-| Global `AutoValidateAntiforgeryToken` | ✅ Matches |
-| `IgnoreAntiforgeryToken` on Logout | ✅ Appropriate use |
-| `ValidateAntiForgeryToken` on protected API | ✅ Matches |
-| Refresh token after auth | ✅ Via _Host + UserController |
-| Client-readable cookie name | ⚠️ Solution uses `XSRF-RequestToken` (custom interceptor) vs docs' `XSRF-TOKEN` (Angular default) — both valid |
-| Antiforgery cookie security | ✅ Solution is stricter (`__Host-`, Always Secure, Strict SameSite) |
-| Form field for logout | ✅ Uses `__RequestVerificationToken` |
-| AddControllersWithViews | ✅ Correct for antiforgery |
-
-**Conclusion:** The implementation follows Microsoft's XSRF guidance. Differences are either **stricter** (cookie naming and security) or **equivalent** (custom cookie name + interceptor instead of Angular's default `XSRF-TOKEN`). If running in a server farm, configure [Data Protection](https://learn.microsoft.com/en-us/aspnet/core/security/data-protection/configuration/overview) for a shared key store.
 
 ---
 
