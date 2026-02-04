@@ -1,0 +1,57 @@
+import { CommonModule } from '@angular/common';
+import { HttpClient } from '@angular/common/http';
+import { Component, OnInit, inject } from '@angular/core';
+import { Observable } from 'rxjs';
+import { getCookie } from './getCookie';
+
+interface Claim {
+  type: string;
+  value: string;
+}
+
+interface UserProfile {
+  isAuthenticated: boolean;
+  nameClaimType: string;
+  roleClaimType: string;
+  claims: Claim[];
+}
+
+@Component({
+    selector: 'app-home',
+    templateUrl: 'home.component.html',
+    imports: [CommonModule]
+})
+export class HomeComponent implements OnInit {
+  private readonly httpClient = inject(HttpClient);
+  dataFromAzureProtectedApi$?: Observable<string[]>;
+  userProfileClaims$?: Observable<UserProfile>;
+
+  ngOnInit() {
+    console.info('home component');
+    
+    this.getUserProfile();
+  }
+
+  getXsrfToken(): string {
+    return getCookie('XSRF-RequestToken');
+  }
+
+  getUserProfile() {
+    this.userProfileClaims$ = this.httpClient.get<UserProfile>(
+      `${this.getCurrentHost()}/api/User`
+    );
+  }
+
+  getWeatherForecastData() {
+    this.dataFromAzureProtectedApi$ = this.httpClient.get<string[]>(
+      `${this.getCurrentHost()}/api/WeatherApi`
+    );
+  }
+
+  private getCurrentHost() {
+    const host = globalThis.location.host;
+    const url = `${globalThis.location.protocol}//${host}`;
+
+    return url;
+  }
+}
